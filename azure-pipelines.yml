@@ -1,0 +1,205 @@
+trigger:
+  - none
+
+schedules:
+  - cron: "0 6 * * 1"  # Runs every Monday at 6:00 AM UTC
+    displayName: "Weekly SSL Expiration Check"
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: subscriptionId
+    displayName: "Azure Subscription ID"
+    type: string
+
+  - name: resourceGroupName
+    displayName: "Resource Group Name (optional, leave empty to scan entire subscription)"
+    type: string
+    default: ""
+
+  - name: keyVaultName
+    displayName: "Key Vault Name"
+    type: string
+
+  - name: appGatewayName
+    displayName: "Application Gateway Name (optional)"
+    type: string
+    default: ""
+
+  - name: appGatewayResourceGroup
+    displayName: "App Gateway Resource Group (optional, defaults to same RG)"
+    type: string
+    default: ""
+
+  - name: expirationThresholdDays
+    displayName: "Expiration Threshold (days) - treat as expired if within N days"
+    type: number
+    default: 30
+
+  - name: appNames
+    displayName: "Specific App Names (comma-separated, leave empty for all)"
+    type: string
+    default: ""
+
+variables:
+  - name: isProduction
+    value: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/main') }}
+
+pool:
+  vmImage: "windows-latest"
+
+stages:
+  # ============================================================
+  # Stage 1: Check SSL Certificate Expiration
+  # ============================================================
+  - stage: CheckSSLExpiration
+    displayName: "Check SSL Certificate Expiration"
+    jobs:
+      - job: CheckCerts
+        displayName: "Scan SSL Certificates"
+        steps:
+          - task: AzurePowerShell@5
+            name: sslCheck
+            displayName: "Check SSL Expiration Dates"
+            inputs:
+              azureSubscription: "$(AzureServiceConnection)"
+              ScriptType: "FilePath"
+              ScriptPath: "$(Build.SourcesDirectory)/scripts/Check-SSLExpiration.ps1"
+              ScriptArguments: >-
+                -SubscriptionId "${{ parameters.subscriptionId }}"
+                -ExpirationThresholdDays ${{ parameters.expirationThresholdDays }}
+                ${{ if ne(parameters.resourceGroupName, '') }}:
+                  -ResourceGroupName "${{ parameters.resourceGroupName }}"
+                ${{ if ne(parameters.appNames, '') }}:
+                  -AppNames "${{ parameters.appNames }}".Split(",")
+              azurePowerShellVersion: "LatestVersion"
+              pwsh: true
+
+  # ============================================================
+  # Stage 2: Check Key Vault for Renewed Certificates
+  # ============================================================
+  - stage: CheckKeyVault
+    displayName: "Check Key Vault for Renewed Certs"
+    dependsOn: CheckSSLExpiration
+    condition: eq(stageDependencies.CheckSSLExpiration.CheckCerts.outputs['sslCheck.HasExpiredCerts'], 'true')
+    jobs:
+      - job: FindRenewed
+        displayName: "Search Key Vault for Renewed Certificates"
+        variables:
+          expiredCertsData: $[stageDependencies.CheckSSLExpiration.CheckCerts.outputs['sslCheck.ExpiredCerts']]
+        steps:
+          - task: AzurePowerShell@5
+            name: kvCheck
+            displayName: "Find Renewed Certificates in Key Vault"
+            inputs:
+              azureSubscription: "$(AzureServiceConnection)"
+              ScriptType: "FilePath"
+              ScriptPath: "$(Build.SourcesDirectory)/scripts/Find-RenewedCert.ps1"
+              ScriptArguments: >-
+                -KeyVaultName "${{ parameters.keyVaultName }}"
+                -ExpiredCertsJson '$(expiredCertsData)'
+              azurePowerShellVersion: "LatestVersion"
+              pwsh: true
+
+  # ============================================================
+  # Stage 3: Bind Renewed Certificates
+  # ============================================================
+  - stage: BindCertificates
+    displayName: "Bind Renewed Certificates"
+    dependsOn: CheckKeyVault
+    condition: eq(stageDependencies.CheckKeyVault.FindRenewed.outputs['kvCheck.HasRenewedCerts'], 'true')
+    jobs:
+      - job: BindCerts
+        displayName: "Bind Certificates to App Service & App Gateway"
+        variables:
+          renewedCertsData: $[stageDependencies.CheckKeyVault.FindRenewed.outputs['kvCheck.RenewedCerts']]
+        steps:
+          # Manual approval gate before making changes
+          - task: ManualValidation@0
+            displayName: "Approve Certificate Binding"
+            inputs:
+              notifyUsers: "$(ApprovalNotifyUsers)"
+              instructions: |
+                Renewed SSL certificates have been found in Key Vault.
+                
+                Please review the pipeline logs from the previous stage to see 
+                which certificates will be updated, then approve to proceed 
+                with binding the new certificates.
+                
+                This will update:
+                - App Service / Container App SSL bindings
+                - Application Gateway HTTPS listeners (if configured)
+              onTimeout: "reject"
+            timeoutInMinutes: 1440  # 24 hours
+
+          - task: AzurePowerShell@5
+            name: bindStep
+            displayName: "Bind Renewed Certificates"
+            inputs:
+              azureSubscription: "$(AzureServiceConnection)"
+              ScriptType: "FilePath"
+              ScriptPath: "$(Build.SourcesDirectory)/scripts/Bind-RenewedCert.ps1"
+              ScriptArguments: >-
+                -RenewedCertsJson '$(renewedCertsData)'
+                -KeyVaultName "${{ parameters.keyVaultName }}"
+                ${{ if ne(parameters.appGatewayName, '') }}:
+                  -AppGatewayName "${{ parameters.appGatewayName }}"
+                  -AppGatewayResourceGroup "${{ if ne(parameters.appGatewayResourceGroup, ''), parameters.appGatewayResourceGroup, parameters.resourceGroupName }}"
+              azurePowerShellVersion: "LatestVersion"
+              pwsh: true
+
+  # ============================================================
+  # Stage 4: Notification (always runs)
+  # ============================================================
+  - stage: Notify
+    displayName: "Send Notification"
+    dependsOn:
+      - CheckSSLExpiration
+      - CheckKeyVault
+      - BindCertificates
+    condition: always()
+    jobs:
+      - job: SendNotification
+        displayName: "Send Status Notification"
+        variables:
+          hasExpired: $[stageDependencies.CheckSSLExpiration.CheckCerts.outputs['sslCheck.HasExpiredCerts']]
+          hasRenewed: $[coalesce(stageDependencies.CheckKeyVault.FindRenewed.outputs['kvCheck.HasRenewedCerts'], 'false')]
+          bindStageResult: $[stageDependencies.BindCertificates.BindCerts.result]
+        steps:
+          - powershell: |
+              $hasExpired = "$(hasExpired)"
+              $hasRenewed = "$(hasRenewed)"
+              $bindResult = "$(bindStageResult)"
+              
+              Write-Host "============================================="
+              Write-Host "SSL Certificate Renewal Pipeline Summary"
+              Write-Host "============================================="
+              
+              if ($hasExpired -ne "true") {
+                  Write-Host "Status: ALL CERTIFICATES VALID"
+                  Write-Host "No certificates are expired or expiring within the threshold."
+                  $status = "Healthy"
+              }
+              elseif ($hasRenewed -ne "true") {
+                  Write-Host "Status: ACTION REQUIRED"
+                  Write-Host "Expired certificates were found but NO renewed certificates exist in Key Vault."
+                  Write-Host "Please manually renew the certificates and upload to Key Vault."
+                  $status = "ActionRequired"
+              }
+              elseif ($bindResult -eq "Succeeded") {
+                  Write-Host "Status: CERTIFICATES RENEWED SUCCESSFULLY"
+                  Write-Host "Renewed certificates have been bound to App Service and App Gateway."
+                  $status = "Renewed"
+              }
+              else {
+                  Write-Host "Status: BINDING FAILED OR SKIPPED"
+                  Write-Host "Renewed certificates were found but binding failed or was not approved."
+                  Write-Host "Bind stage result: $bindResult"
+                  $status = "Failed"
+              }
+              
+              Write-Host "============================================="
+              Write-Host "##vso[task.setvariable variable=PipelineStatus]$status"
+            displayName: "Generate Summary"

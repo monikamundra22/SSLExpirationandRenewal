@@ -1,0 +1,214 @@
+name: SSL Expiration Check & Auto-Renewal
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Every Monday at 6:00 AM UTC
+
+  workflow_dispatch:
+    inputs:
+      subscriptionId:
+        description: "Azure Subscription ID"
+        required: true
+        type: string
+      resourceGroupName:
+        description: "Resource Group Name (leave empty to scan entire subscription)"
+        required: false
+        default: ""
+        type: string
+      keyVaultName:
+        description: "Key Vault Name"
+        required: true
+        type: string
+      appGatewayName:
+        description: "Application Gateway Name (optional)"
+        required: false
+        default: ""
+        type: string
+      appGatewayResourceGroup:
+        description: "App Gateway Resource Group (optional, defaults to same RG)"
+        required: false
+        default: ""
+        type: string
+      expirationThresholdDays:
+        description: "Expiration Threshold (days) - treat as expired if within N days"
+        required: false
+        default: "30"
+        type: string
+      appNames:
+        description: "Specific App Names (comma-separated, leave empty for all)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  SUBSCRIPTION_ID: ${{ github.event.inputs.subscriptionId || vars.AZURE_SUBSCRIPTION_ID }}
+  RESOURCE_GROUP: ${{ github.event.inputs.resourceGroupName || '' }}
+  KEY_VAULT_NAME: ${{ github.event.inputs.keyVaultName || vars.AZURE_KEY_VAULT_NAME }}
+  APP_GATEWAY_NAME: ${{ github.event.inputs.appGatewayName || '' }}
+  APP_GATEWAY_RG: ${{ github.event.inputs.appGatewayResourceGroup || '' }}
+  EXPIRATION_THRESHOLD: ${{ github.event.inputs.expirationThresholdDays || '30' }}
+  APP_NAMES: ${{ github.event.inputs.appNames || '' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # Job 1: Check SSL Certificate Expiration
+  # ============================================================
+  check-ssl-expiration:
+    name: "Scan SSL Certificates"
+    runs-on: windows-latest
+    outputs:
+      has_expired_certs: ${{ steps.ssl_check.outputs.HasExpiredCerts }}
+      expired_certs: ${{ steps.ssl_check.outputs.ExpiredCerts }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Check SSL Expiration Dates
+        id: ssl_check
+        shell: pwsh
+        run: |
+          $args = @{
+            SubscriptionId          = "${{ env.SUBSCRIPTION_ID }}"
+            ExpirationThresholdDays = [int]"${{ env.EXPIRATION_THRESHOLD }}"
+          }
+
+          if ("${{ env.RESOURCE_GROUP }}" -ne "") {
+            $args.ResourceGroupName = "${{ env.RESOURCE_GROUP }}"
+          }
+
+          if ("${{ env.APP_NAMES }}" -ne "") {
+            $args.AppNames = "${{ env.APP_NAMES }}".Split(",")
+          }
+
+          & "${{ github.workspace }}/scripts/Check-SSLExpiration.ps1" @args
+
+  # ============================================================
+  # Job 2: Check Key Vault for Renewed Certificates
+  # ============================================================
+  check-keyvault:
+    name: "Search Key Vault for Renewed Certs"
+    runs-on: windows-latest
+    needs: check-ssl-expiration
+    if: needs.check-ssl-expiration.outputs.has_expired_certs == 'true'
+    outputs:
+      has_renewed_certs: ${{ steps.kv_check.outputs.HasRenewedCerts }}
+      renewed_certs: ${{ steps.kv_check.outputs.RenewedCerts }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Find Renewed Certificates in Key Vault
+        id: kv_check
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}/scripts/Find-RenewedCert.ps1" `
+            -KeyVaultName "${{ env.KEY_VAULT_NAME }}" `
+            -ExpiredCertsJson '${{ needs.check-ssl-expiration.outputs.expired_certs }}'
+
+  # ============================================================
+  # Job 3: Bind Renewed Certificates (requires manual approval)
+  # ============================================================
+  bind-certificates:
+    name: "Bind Renewed Certificates"
+    runs-on: windows-latest
+    needs: check-keyvault
+    if: needs.check-keyvault.outputs.has_renewed_certs == 'true'
+    environment: production  # Requires manual approval via GitHub Environment protection rules
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Bind Renewed Certificates
+        id: bind_step
+        shell: pwsh
+        run: |
+          $args = @{
+            RenewedCertsJson = '${{ needs.check-keyvault.outputs.renewed_certs }}'
+            KeyVaultName     = "${{ env.KEY_VAULT_NAME }}"
+          }
+
+          if ("${{ env.APP_GATEWAY_NAME }}" -ne "") {
+            $args.AppGatewayName = "${{ env.APP_GATEWAY_NAME }}"
+            $gwRg = "${{ env.APP_GATEWAY_RG }}"
+            if ($gwRg -eq "") { $gwRg = "${{ env.RESOURCE_GROUP }}" }
+            $args.AppGatewayResourceGroup = $gwRg
+          }
+
+          & "${{ github.workspace }}/scripts/Bind-RenewedCert.ps1" @args
+
+  # ============================================================
+  # Job 4: Notification (always runs)
+  # ============================================================
+  notify:
+    name: "Send Status Notification"
+    runs-on: windows-latest
+    needs: [check-ssl-expiration, check-keyvault, bind-certificates]
+    if: always()
+    steps:
+      - name: Generate Summary
+        shell: pwsh
+        run: |
+          $hasExpired = "${{ needs.check-ssl-expiration.outputs.has_expired_certs }}"
+          $hasRenewed = "${{ needs.check-keyvault.outputs.has_renewed_certs }}"
+          $bindResult = "${{ needs.bind-certificates.result }}"
+
+          Write-Host "============================================="
+          Write-Host "SSL Certificate Renewal Pipeline Summary"
+          Write-Host "============================================="
+
+          if ($hasExpired -ne "true") {
+              $status = "Healthy"
+              $icon = ":white_check_mark:"
+              $msg = "All certificates are valid. No action needed."
+          }
+          elseif ($hasRenewed -ne "true") {
+              $status = "ActionRequired"
+              $icon = ":warning:"
+              $msg = "Expired certificates found but NO renewed certificates exist in Key Vault. Please renew manually."
+          }
+          elseif ($bindResult -eq "success") {
+              $status = "Renewed"
+              $icon = ":white_check_mark:"
+              $msg = "Renewed certificates have been bound to App Service and App Gateway."
+          }
+          else {
+              $status = "Failed"
+              $icon = ":x:"
+              $msg = "Renewed certificates were found but binding failed or was not approved. Bind result: $bindResult"
+          }
+
+          Write-Host "Status: $status"
+          Write-Host $msg
+
+          # Write to GitHub Actions Job Summary
+          $summary = @"
+          ## SSL Certificate Renewal Report $icon
+
+          | Item | Value |
+          |------|-------|
+          | **Status** | $status |
+          | **Subscription** | ${{ env.SUBSCRIPTION_ID }} |
+          | **Threshold** | ${{ env.EXPIRATION_THRESHOLD }} days |
+
+          **Details:** $msg
+          "@
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

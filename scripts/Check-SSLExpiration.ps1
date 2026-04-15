@@ -239,18 +239,18 @@ if ($expiredCerts.Count -gt 0) {
     Write-Warning "$($expiredCerts.Count) certificate(s) are expired or expiring within $ExpirationThresholdDays days!"
     $expiredCerts | Format-Table AppType, AppName, HostName, Thumbprint, ExpirationDate, DaysUntilExpiry -AutoSize
 
-    # Export expired cert details as JSON for downstream tasks
+    # Export expired cert details as JSON for downstream jobs
     $expiredJson = $expiredCerts | ConvertTo-Json -Compress
-    Write-Host "##vso[task.setvariable variable=ExpiredCerts;isOutput=true]$expiredJson"
-    Write-Host "##vso[task.setvariable variable=HasExpiredCerts;isOutput=true]true"
+    "ExpiredCerts=$expiredJson" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+    "HasExpiredCerts=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 }
 else {
     Write-Host "`nAll certificates are valid."
-    Write-Host "##vso[task.setvariable variable=HasExpiredCerts;isOutput=true]false"
+    "HasExpiredCerts=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 }
 
 # Export full results
 $allJson = $allCerts | ConvertTo-Json -Compress
-Write-Host "##vso[task.setvariable variable=AllCerts;isOutput=true]$allJson"
+"AllCerts=$allJson" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
 #endregion

@@ -1,8 +1,8 @@
 # SSL Expiration Check & Auto-Renewal Pipeline
 
-Automated Azure DevOps pipeline that checks SSL certificate expiration on Azure Web Apps and Container Apps, finds renewed certificates in Key Vault, and rebinds them to App Service (ASE/ACE) and Application Gateway.
+GitHub Actions workflow that checks SSL certificate expiration on Azure Web Apps and Container Apps, finds renewed certificates in Key Vault, and rebinds them to App Service (ASE/ACE) and Application Gateway.
 
-## Pipeline Flow
+## Workflow Flow
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────┐
@@ -16,25 +16,36 @@ Automated Azure DevOps pipeline that checks SSL certificate expiration on Azure 
 
 ## Prerequisites
 
-### Azure Service Connection
-Create an Azure Resource Manager service connection in Azure DevOps with permissions to:
+### Azure Credentials
+Create a service principal and store its credentials as a GitHub repository secret named `AZURE_CREDENTIALS` (JSON format from `az ad sp create-for-rbac`). The service principal needs permissions to:
 - **Read** App Service and Container App configurations
 - **Read** Key Vault certificates and secrets
 - **Write** App Service SSL bindings
 - **Write** Application Gateway configuration
 
-### Pipeline Variables
-Set these variables in your pipeline (or variable group):
+### GitHub Repository Configuration
+
+**Secrets** (Settings → Secrets and variables → Actions):
+
+| Secret | Description | Required |
+|--------|-------------|----------|
+| `AZURE_CREDENTIALS` | Service principal credentials JSON (`az ad sp create-for-rbac --sdk-auth`) | Yes |
+
+**Variables** (Settings → Secrets and variables → Actions → Variables):
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `AzureServiceConnection` | Name of your Azure DevOps service connection | Yes |
-| `ApprovalNotifyUsers` | Email(s) for manual approval notifications | Yes |
+| `AZURE_SUBSCRIPTION_ID` | Default Azure Subscription ID (used for scheduled runs) | For scheduled runs |
+| `AZURE_KEY_VAULT_NAME` | Default Key Vault name (used for scheduled runs) | For scheduled runs |
 
-### Pipeline Parameters (set at run time)
+**Environment** (Settings → Environments):
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
+Create an environment named `production` with **required reviewers** to enable the manual approval gate before certificate binding.
+
+### Workflow Inputs (set when triggering manually)
+
+| Input | Description | Default |
+|-------|-------------|---------|
 | `subscriptionId` | Azure Subscription ID | — |
 | `resourceGroupName` | Resource Group (empty = scan entire subscription) | *(empty)* |
 | `keyVaultName` | Key Vault with renewed certs | — |
@@ -46,39 +57,41 @@ Set these variables in your pipeline (or variable group):
 ## Files
 
 ```
-├── azure-pipelines.yml                 # Pipeline definition (4 stages)
+├── .github/workflows/
+│   └── ssl-check-and-renew.yml        # GitHub Actions workflow (4 jobs)
 └── scripts/
-    ├── Check-SSLExpiration.ps1         # Stage 1: Scan SSL certs on Web/Container Apps
-    ├── Find-RenewedCert.ps1           # Stage 2: Search Key Vault for valid replacements
-    └── Bind-RenewedCert.ps1           # Stage 3: Bind new certs to ASE/ACE + App Gateway
+    ├── Check-SSLExpiration.ps1         # Job 1: Scan SSL certs on Web/Container Apps
+    ├── Find-RenewedCert.ps1           # Job 2: Search Key Vault for valid replacements
+    └── Bind-RenewedCert.ps1           # Job 3: Bind new certs to ASE/ACE + App Gateway
 ```
 
 ## How It Works
 
-### Stage 1 — Check SSL Expiration
+### Job 1 — Check SSL Expiration
 - Scans all App Services and Container Apps across the entire subscription (or a specific Resource Group if provided)
 - Collects SSL binding details: thumbprint, expiration date, hostname
 - Marks certificates as expired if they're past expiry or within the threshold
-- Outputs `HasExpiredCerts` and `ExpiredCerts` (JSON) for downstream stages
+- Outputs `has_expired_certs` and `expired_certs` (JSON) for downstream jobs
 
-### Stage 2 — Search Key Vault
+### Job 2 — Search Key Vault
 - Runs **only** if expired certificates were found
 - For each expired cert, searches Key Vault for a certificate with matching subject name
 - Skips certs with the same thumbprint (same old cert)
 - Picks the cert with the longest remaining validity
-- Outputs `HasRenewedCerts` and `RenewedCerts` (JSON)
+- Outputs `has_renewed_certs` and `renewed_certs` (JSON)
 
-### Stage 3 — Bind Renewed Certificates
+### Job 3 — Bind Renewed Certificates
 - Runs **only** if renewed certificates were found in Key Vault
-- **Manual approval gate** before making any changes
+- **Manual approval gate** via GitHub Environment protection rules (`production` environment)
 - For **Web Apps (ASE/ACE)**: imports the Key Vault cert and creates an SNI SSL binding
 - For **Container Apps**: updates the managed environment certificate
 - For **Application Gateway**: adds/updates the SSL certificate and updates the HTTPS listener
 - Reports success/failure counts
 
-### Stage 4 — Notification
-- Always runs regardless of previous stage outcomes
-- Summarizes the pipeline result:
+### Job 4 — Notification
+- Always runs regardless of previous job outcomes
+- Writes a summary to the **GitHub Actions Job Summary**
+- Reports the pipeline result:
   - **Healthy** — all certs valid
   - **ActionRequired** — expired certs found but no renewals in Key Vault
   - **Renewed** — certs successfully rebound
@@ -86,7 +99,7 @@ Set these variables in your pipeline (or variable group):
 
 ## Schedule
 
-The pipeline runs automatically **every Monday at 6:00 AM UTC**. You can also trigger it manually from Azure DevOps.
+The workflow runs automatically **every Monday at 6:00 AM UTC**. You can also trigger it manually via **Actions → SSL Expiration Check & Auto-Renewal → Run workflow**.
 
 ## Service Principal Permissions
 

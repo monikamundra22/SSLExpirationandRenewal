@@ -109,7 +109,7 @@ $expiredCerts = $ExpiredCertsJson | ConvertFrom-Json
 
 if (-not $expiredCerts -or $expiredCerts.Count -eq 0) {
     Write-Host "No expired certificates to process."
-    Write-Host "##vso[task.setvariable variable=HasRenewedCerts;isOutput=true]false"
+    "HasRenewedCerts=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
     exit 0
 }
 
@@ -160,12 +160,12 @@ if ($renewalResults.Count -gt 0) {
     $renewalResults | Format-Table AppName, HostName, KeyVaultCertName, NewThumbprint, NewExpirationDate -AutoSize
 
     $renewedJson = $renewalResults | ConvertTo-Json -Compress
-    Write-Host "##vso[task.setvariable variable=RenewedCerts;isOutput=true]$renewedJson"
-    Write-Host "##vso[task.setvariable variable=HasRenewedCerts;isOutput=true]true"
+    "RenewedCerts=$renewedJson" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+    "HasRenewedCerts=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 }
 else {
     Write-Warning "No renewed certificates found in Key Vault for any expired certificate."
-    Write-Host "##vso[task.setvariable variable=HasRenewedCerts;isOutput=true]false"
+    "HasRenewedCerts=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 }
 
 #endregion
